@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+"""
+uto.py — Universal Timeout Orchestrator (Python, single-file)
+------------------------------------------------------------
+Objetivo: você digita comandos "normais" (npm, git, docker, etc.) e eles já
+rodam com timeout. Sem root. Um único comando de ativação e pronto.
+
+Modos:
+- Manager (chamado como "uto" ou "universal-timeout"): cria shims, habilita/
+  desabilita, pausa, lista, detecta timeouts, etc.
+- Shim (chamado via symlink com o nome do comando real): aplica o timeout e
+  executa o binário verdadeiro fora do diretório de shims.
+
+Ativação rápida:
+  chmod +x uto.py && mv uto.py ~/.local/bin/uto
+  uto enable --auto
+  # Abra um novo terminal e pronto.
+
+Compatível com Linux/macOS (XDG dirs). Requer Python 3.8+.
+"""
+from __future__ import annotations
+
+import errno
+import os
+import shlex
+import shutil
+import signal
+import stat
+import sys
+import time
+from pathlib import Path
+from subprocess import Popen, TimeoutExpired
+
+# =========================
+# Configuração / diretórios
+# =========================
+SCRIPT_NAME = "universal-timeout"
+SCRIPT_PATH = Path(__file__).resolve()
+
+def getenv_int(name: str, default: int) -> int:
+    try:
+        val = os.getenv(name, None)
+        return int(val) if val is not None else default
+    except (TypeError, ValueError):
+        return default
+
+DEBUG = os.getenv("UNIVERSAL_TIMEOUT_DEBUG", "0") == "1"
+VERBOSE = os.getenv("UNIVERSAL_TIMEOUT_VERBOSE", "1") == "1"
+
+DEFAULT_TIMEOUT = getenv_int("UNIVERSAL_TIMEOUT_DEFAULT", 10)
+DEFAULT_GRACE   = getenv_int("UNIVERSAL_TIMEOUT_GRACE", 5)
+
+def parse_signal(spec: str) -> int:
+    s = (spec or "TERM").upper().strip()
+    if s.startswith("SIG"):
+        s = s[3:]
+    if s.isdigit():
+        try:
+            return int(s)
+        except ValueError:
+            return signal.SIGTERM
+    return getattr(signal, f"SIG{s}", signal.SIGTERM)
+
+TERM_SIGNAL_NAME = os.getenv("UNIVERSAL_TIMEOUT_TERM_SIGNAL", "TERM")
+TERM_SIGNAL = parse_signal(TERM_SIGNAL_NAME)
+
+XDG_STATE_HOME = Path(os.getenv("XDG_STATE_HOME", Path.home()/".local"/"state"))
+XDG_CONFIG_HOME = Path(os.getenv("XDG_CONFIG_HOME", Path.home()/".config"))
+XDG_DATA_HOME  = Path(os.getenv("XDG_DATA_HOME",  Path.home()/".local"/"share"))
+
+ROOT_DIR = XDG_DATA_HOME / "uto"
+STATE_DIR = ROOT_DIR / "state"
+SHIM_DIR = ROOT_DIR / "shims"
+SHIM_DIR_REAL = os.path.realpath(str(SHIM_DIR))
+
+LOG_FILE = Path(os.getenv("UNIVERSAL_TIMEOUT_LOG", str(STATE_DIR / f"{SCRIPT_NAME}.log")))
+CONFIG_USER = XDG_CONFIG_HOME / "universal-timeout" / "overrides.conf"
+CONFIG_PROJECT = Path(".universal-timeout.conf")
+
+for p in (STATE_DIR, SHIM_DIR, CONFIG_USER.parent):
+    p.mkdir(parents=True, exist_ok=True)
+
+DISABLE_FILE = STATE_DIR / "disabled"
+PAUSE_FILE = STATE_DIR / "paused_until"
+
+# =========================
+# Utilidades
+# =========================
+
+def log(msg: str) -> None:
+    sys.stderr.write(f"[{SCRIPT_NAME}] {msg}\n")
+    if DEBUG:
+        try:
+            with LOG_FILE.open("a", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S "))
+                f.write(msg + "\n")
+        except Exception:
+            pass
+
+def normpath_real(p: str) -> str:
+    try:
+        return os.path.realpath(os.path.abspath(p.rstrip(os.sep)))
+    except Exception:
+        return p
+
+def path_without_shims() -> str:
+    parts = [normpath_real(p) for p in os.getenv("PATH", "").split(":") if p]
+    parts = [p for p in parts if p != SHIM_DIR_REAL]
+    return ":".join(parts)
+
+def which_outside_shims(name: str) -> str | None:
+    old = os.getenv("PATH", "")
+    try:
+        os.environ["PATH"] = path_without_shims()
+        return shutil.which(name)
+    finally:
+        os.environ["PATH"] = old
+
+def fmt_ts(ts: int) -> str:
+    try:
+        return time.strftime("%H:%M:%S", time.localtime(ts))
+    except Exception:
+        return str(ts)
+
+# =========================
+# Tabela de timeouts + overrides
+# =========================
+# Ordem importa: chaves mais específicas primeiro.
+COMMAND_TIMEOUTS = {
+    # PM2
+    "pm2 gracefulReload": 60, "pm2 reload": 45, "pm2 restart": 30, "pm2 start": 30,
+    "pm2 stop": 20, "pm2 delete": 20, "pm2 kill": 15, "pm2 monit": 45,
+    "pm2 logs": 20, "pm2 status": 8, "pm2 list": 8, "pm2 show": 8,
+    "pm2 describe": 8, "pm2 info": 8,
+
+    # npm/yarn/pnpm/bun
+    "npm run test:watch": 45, "npm run typecheck": 90, "npm run lint": 90,
+    "npm run build": 180, "npm run test": 180, "npm run dev": 45,
+    "npm run start": 45, "npm run serve": 45, "npm run watch": 45,
+    "npm install": 300, "npm ci": 300, "npm audit": 90, "npm outdated": 45,
+
+    "yarn test:watch": 45, "yarn typecheck": 90, "yarn lint": 90, "yarn build": 180,
+    "yarn test": 180, "yarn dev": 45, "yarn start": 45, "yarn serve": 45,
+    "yarn watch": 45, "yarn install": 300, "yarn audit": 90, "yarn outdated": 45,
+
+    "pnpm install": 300, "pnpm build": 180, "pnpm test": 180, "pnpm dev": 45, "pnpm start": 45,
+    "bun install": 180, "bun run": 180,
+
+    # frameworks
+    "next build": 180, "next export": 180, "next dev": 45, "next start": 45,
+    "react-scripts start": 45, "vue-cli-service serve": 45,
+    "ng test": 180, "ng build": 180, "ng serve": 45,
+
+    # docker
+    "docker build": 600, "docker pull": 300, "docker push": 300,
+    "docker-compose up": 60, "docker-compose down": 30,
+    "docker logs": 20, "docker-compose logs": 20,
+    "docker compose up": 60, "docker compose down": 30, "docker compose logs": 20,
+
+    # git
+    "git clone": 300, "git pull": 60, "git push": 120, "git fetch": 60,
+
+    # testes
+    "cypress run": 600, "playwright test": 600, "jest": 300, "mocha": 300,
+    "vitest": 300, "ava": 300,
+
+    # rede
+    "curl": 15, "ping": 15, "wget": 60, "traceroute": 60, "nslookup": 15, "dig": 15,
+
+    # build tools / linguagens
+    "webpack": 180, "rollup": 180, "vite": 180, "esbuild": 90, "tsc": 120, "babel": 90,
+    "go build": 300, "go test": 300, "cargo build": 300, "cargo test": 300,
+    "make": 300,
+
+    # Python eco
+    "pip install": 300, "pip3 install": 300, "poetry install": 300,
+
+    # servers
+    "python -m http.server": 45, "php -S": 45, "ruby -run -e httpd": 45,
+    "node server.js": 45, "nodemon": 45,
+
+    # DB/CLI
+    "mysql": 15, "psql": 15, "mongosh": 15, "redis-cli": 15,
+
+    # sistema
+    "tail -f": 20, "less": 15, "more": 15, "watch": 45, "htop": 45, "top": 15,
+    "ps aux": 8, "netstat": 8, "ss": 8, "lsof": 15, "find": 120, "grep -r": 120,
+    "rsync": 600, "scp": 300,
+
+    # DevOps
+    "kubectl logs": 30, "kubectl get": 15, "kubectl apply": 120,
+}
+
+EXCLUDE_DEFAULT = [
+    "uto", "universal-timeout", "timeout", "gtimeout",
+    "bash", "zsh", "sh", "sudo", "su", "env", "command", "builtin", "type",
+    "which", "hash", "eval", "exec", "time", "cd", "pushd", "popd", "pwd",
+    "exit", "jobs", "fg", "bg", "disown", "umask", "ulimit", "alias",
+    "unalias", "set", "shopt", "ssh", "sftp"  # ssh/sftp ficam excluídos
+]
+EXCLUDE_ENV = [x.strip() for x in os.getenv("UNIVERSAL_TIMEOUT_EXCLUDE", "").split(",") if x.strip()]
+EXCLUDE = list(dict.fromkeys(EXCLUDE_DEFAULT + EXCLUDE_ENV))  # dedup, preserve order
+
+# =========================
+# Overrides simples (pattern=segundos)
+# =========================
+
+def load_overrides(path: Path) -> None:
+    if not path.is_file():
+        return
+    try:
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                k, v = line.split("=", 1)
+                k = k.strip()
+                try:
+                    COMMAND_TIMEOUTS[k] = int(v.strip())
+                except ValueError:
+                    pass
+    except Exception as e:
+        log(f"erro lendo overrides {path}: {e}")
+
+load_overrides(CONFIG_USER)
+load_overrides(CONFIG_PROJECT)
+
+# Pré-calcula padrões por tamanho (mais específico primeiro)
+def _sorted_patterns_by_len():
+    return sorted(COMMAND_TIMEOUTS.keys(), key=lambda k: len(k), reverse=True)
+
+PATTERNS = _sorted_patterns_by_len()
+
+# =========================
+# Detecção de timeout
+# =========================
+
+def normalize_cmd(cmd: str) -> str:
+    # simplifica só para heurísticas
+    s = cmd
+    # remove opções longas e curtas simples (-x); mantém subcomando
+    import re
+    s = re.sub(r"\s--\S+", "", s)
+    s = re.sub(r"\s-[a-zA-Z]\b", "", s)
+    toks = s.split()
+    return " ".join(toks[:2])
+
+def tokens(cmd: str) -> list[str]:
+    try:
+        return shlex.split(cmd)
+    except Exception:
+        return cmd.split()
+
+def match_pattern(cmd: str) -> tuple[str | None, int | None]:
+    hay = f" {cmd} "
+    for pat in PATTERNS:
+        if f" {pat} " in hay:
+            return pat, COMMAND_TIMEOUTS[pat]
+    return None, None
+
+def smart_timeout(cmd: str) -> tuple[int, str]:
+    """
+    Retorna (timeout, motivo)
+    motivo: "pattern:<pat>" ou "heuristic:<hint>" ou "default"
+    """
+    pat, t = match_pattern(cmd)
+    if t is not None:
+        return t, f"pattern:{pat}"
+
+    # heurísticas
+    base = normalize_cmd(cmd)
+    toks = [tok.lower() for tok in tokens(base)]
+
+    def any_tok(words): return any(w in toks for w in words)
+    def contains_any(subs): return any(s in base for s in subs)
+
+    if any_tok(["logs", "tail", "follow"]):
+        return 15, "heuristic:logs"
+    if any_tok(["test", "spec"]):
+        return 120, "heuristic:test"
+    if any_tok(["build", "compile"]):
+        return 120, "heuristic:build"
+    if any_tok(["install", "update", "upgrade"]):
+        return 180, "heuristic:install"
+    if any_tok(["dev", "serve", "start"]):
+        return 30, "heuristic:serve"
+    if base.startswith(("curl", "wget", "ping")):
+        return 10, "heuristic:net"
+    if base.startswith("docker"):
+        return 30, "heuristic:docker"
+    if base.startswith("git"):
+        return 30, "heuristic:git"
+
+    return DEFAULT_TIMEOUT, "default"
+
+# =========================
+# Execução com timeout (interno, sem depender de coreutils)
+# =========================
+
+def run_with_timeout(argv: list[str], timeout_s: int, grace_s: int) -> int:
+    """Executa argv com timeout. Mata o *grupo* do processo.
+    Retorna: rc do processo ou 124 se timeout.
+    """
+    if DEBUG:
+        log(f"exec: {' '.join(argv)} | timeout={timeout_s}s grace={grace_s}s signal={TERM_SIGNAL} ({TERM_SIGNAL_NAME})")
+    try:
+        # novo grupo de processo pra matar tudo de uma vez
+        proc = Popen(argv, start_new_session=True)
+    except FileNotFoundError:
+        sys.stderr.write(f"{argv[0]}: command not found\n")
+        return 127
+
+    try:
+        return proc.wait(timeout=timeout_s)
+    except TimeoutExpired:
+        # tenta terminar graciosamente
+        try:
+            os.killpg(proc.pid, TERM_SIGNAL)
+        except Exception:
+            pass
+        # espera grace
+        limit = time.time() + max(grace_s, 0)
+        while time.time() < limit:
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+        if proc.poll() is None:
+            # força kill
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                pass
+        return 124
+
+# =========================
+# Manager: criar shims, etc.
+# =========================
+RC_MARK_BEGIN = "# >>> universal-timeout (uto) >>>"
+RC_MARK_END =   "# <<< universal-timeout (uto) <<<"
+
+def rc_snippet() -> str:
+    return f"""
+{RC_MARK_BEGIN}
+# Diretório de shims para forçar timeout em comandos do PATH (uto)
+if [ -d "{SHIM_DIR}" ]; then
+  case ":$PATH:" in
+    *:"{SHIM_DIR}":*) ;;
+    *) export PATH="{SHIM_DIR}:$PATH" ;;
+  esac
+fi
+{RC_MARK_END}
+""".strip() + "\n"
+
+def update_rc_file(path: Path) -> bool:
+    try:
+        text = path.read_text(encoding="utf-8") if path.exists() else ""
+        if RC_MARK_BEGIN in text and RC_MARK_END in text:
+            return False
+        with path.open("a", encoding="utf-8") as f:
+            if text and not text.endswith("\n"):
+                f.write("\n")
+            f.write("\n" + rc_snippet())
+        return True
+    except Exception as e:
+        log(f"não consegui editar {path}: {e}")
+        return False
+
+def list_executables_in_dir(d: Path):
+    try:
+        for p in d.iterdir():
+            try:
+                if p.is_file() and os.access(str(p), os.X_OK):
+                    yield p
+            except Exception:
+                continue
+    except Exception:
+        return
+
+def clean_path_entries() -> list[str]:
+    out = []
+    for raw in os.getenv("PATH", "").split(":"):
+        if not raw:
+            continue
+        p = normpath_real(raw)
+        if p != SHIM_DIR_REAL:
+            out.append(p)
+    return out
+
+def is_excluded(name: str) -> bool:
+    return name in EXCLUDE
+
+def build_shims() -> int:
+    count = 0
+    target = SCRIPT_PATH  # robusto mesmo quando chamado via PATH
+    for d in map(Path, clean_path_entries()):
+        if not d.is_dir():
+            continue
+        for exe in list_executables_in_dir(d):
+            name = exe.name
+            if is_excluded(name):
+                continue
+            shim = SHIM_DIR / name
+            if shim.exists():
+                # evita sobrescrever se já existir (inclusive se não for symlink)
+                continue
+            try:
+                shim.symlink_to(target)
+                count += 1
+            except FileExistsError:
+                pass
+            except OSError as e:
+                if e.errno in (errno.EPERM, errno.EACCES):
+                    continue
+    return count
+
+def cmd_enable(auto: bool):
+    DISABLE_FILE.unlink(missing_ok=True)
+    PAUSE_FILE.unlink(missing_ok=True)
+    SHIM_DIR.mkdir(parents=True, exist_ok=True)
+    made = build_shims()
+    print(f"🟢 uto: shims prontos em {SHIM_DIR} ({made} novos)")
+    if auto:
+        changed = False
+        shell = os.getenv("SHELL", "")
+        rc_candidates = []
+        if shell.endswith("zsh"):
+            rc_candidates.append(Path.home()/".zshrc")
+        if shell.endswith("bash"):
+            rc_candidates.append(Path.home()/".bashrc")
+        # tenta os dois de qualquer forma (idempotente)
+        for rc in {Path.home()/".bashrc", Path.home()/".zshrc"}:
+            rc_candidates.append(rc)
+        for rc in dict.fromkeys(rc_candidates):  # mantém ordem e evita duplicatas
+            if update_rc_file(rc):
+                print(f"   + snippet adicionado em {rc}")
+                changed = True
+        if changed:
+            print("Abra um novo terminal para ativar o PATH.")
+        else:
+            print("Snippet já presente em seus dotfiles.")
+    else:
+        print("Adicione este snippet ao seu ~/.bashrc ou ~/.zshrc:")
+        print(rc_snippet())
+
+def cmd_disable():
+    DISABLE_FILE.write_text("1", encoding="utf-8")
+    print("🔴 uto: enforcement desabilitado (mantém shims, não aplica timeout)")
+
+def cmd_pause(minutes: int):
+    until = int(time.time()) + max(0, minutes)*60
+    PAUSE_FILE.write_text(str(until), encoding="utf-8")
+    print(f"⏸️  uto: pausado por {minutes} min (até {fmt_ts(until)})")
+
+def cmd_resume():
+    PAUSE_FILE.unlink(missing_ok=True)
+    print("▶️  uto: pausa removida (ATIVO)")
+
+def cmd_refresh(clean: bool):
+    if clean and SHIM_DIR.exists():
+        for p in SHIM_DIR.iterdir():
+            try:
+                p.unlink()
+            except Exception:
+                pass
+        print(f"🧹 limpei {SHIM_DIR}")
+    made = build_shims()
+    print(f"🔁 uto: shims atualizados ({made} novos)")
+
+def path_contains_shim_dir() -> bool:
+    parts = [normpath_real(p) for p in os.getenv("PATH", "").split(":") if p]
+    return SHIM_DIR_REAL in parts
+
+def cmd_status() -> int:
+    count = 0
+    if SHIM_DIR.is_dir():
+        try:
+            count = len(list(SHIM_DIR.iterdir()))
+        except Exception:
+            pass
+    in_path = path_contains_shim_dir()
+    print(f"DIR shims: {SHIM_DIR} ({count} links)")
+    print(f"No PATH: {'sim' if in_path else 'não'}")
+    if DISABLE_FILE.exists():
+        print("Status: DESABILITADO")
+    elif PAUSE_FILE.exists():
+        try:
+            until = int(PAUSE_FILE.read_text())
+        except Exception:
+            until = 0
+        now = int(time.time())
+        if now < until:
+            print(f"Status: PAUSADO até {fmt_ts(until)}")
+        else:
+            PAUSE_FILE.unlink(missing_ok=True)
+            print("Status: ATIVO")
+    else:
+        print("Status: ATIVO")
+    return 0
+
+def cmd_list():
+    print("Timeouts configurados (após overrides):")
+    for k in sorted(COMMAND_TIMEOUTS.keys()):
+        print(f"  {k:<30} {COMMAND_TIMEOUTS[k]}s")
+    print("\nExcluídos:", ", ".join(EXCLUDE))
+
+def cmd_detect(cmd: str):
+    t, why = smart_timeout(cmd)
+    print(f"Comando: {cmd}")
+    print(f"Timeout: {t}s")
+    if why:
+        print(f"Motivo:   {why}")
+
+# =========================
+# Shim execution path
+# =========================
+
+def check_gate_and_maybe_bypass(invoked: str, argv: list[str]) -> tuple[bool, int]:
+    # disable / pause -> bypass
+    if DISABLE_FILE.exists():
+        real = which_outside_shims(invoked)
+        if real:
+            os.execv(real, [real] + argv)
+        sys.stderr.write(f"{invoked}: command not found\n")
+        return True, 127
+    if PAUSE_FILE.exists():
+        try:
+            until = int(PAUSE_FILE.read_text())
+        except Exception:
+            until = 0
+        if int(time.time()) < until:
+            real = which_outside_shims(invoked)
+            if real:
+                os.execv(real, [real] + argv)
+            sys.stderr.write(f"{invoked}: command not found\n")
+            return True, 127
+        else:
+            PAUSE_FILE.unlink(missing_ok=True)
+    return False, 0
+
+def run_shim(invoked: str, argv: list[str]) -> int:
+    if invoked in EXCLUDE:
+        real = which_outside_shims(invoked)
+        if real:
+            os.execv(real, [real] + argv)
+        sys.stderr.write(f"{invoked}: command not found\n")
+        return 127
+
+    real = which_outside_shims(invoked)
+    if not real:
+        sys.stderr.write(f"{invoked}: command not found\n")
+        return 127
+
+    cmd_str = " ".join([invoked] + argv)
+    t, why = smart_timeout(cmd_str)
+    grace = DEFAULT_GRACE
+
+    if VERBOSE or DEBUG:
+        sys.stderr.write(f"[uto] {cmd_str}\n")
+        sys.stderr.write(f"[uto] timeout={t}s (grace {grace}s) [{why}]\n")
+
+    rc = run_with_timeout([real] + argv, t, grace)
+    return rc
+
+# =========================
+# Main
+# =========================
+
+def main() -> int:
+    invoked = os.path.basename(sys.argv[0])
+
+    # Manager mode
+    if invoked in ("uto", "universal-timeout"):
+        args = sys.argv[1:]
+        if not args or args[0] in ("help", "-h", "--help"):
+            print("""
+uso: uto <subcomando>
+  enable [--auto]   cria shims; com --auto tenta adicionar snippet ao ~/.bashrc e ~/.zshrc
+  disable           desabilita enforcement (mantém shims)
+  pause <min>       pausa por N minutos
+  resume            remove pausa imediatamente
+  refresh [--clean] reescaneia PATH e recria shims (limpa com --clean)
+  status            mostra estado e PATH
+  list              lista timeouts efetivos e comandos excluídos
+  detect "cmd"      mostra timeout que seria aplicado e a razão
+            """.strip())
+            return 0
+        cmd = args[0]
+        if cmd == "enable":
+            auto = "--auto" in args[1:]
+            cmd_enable(auto); return 0
+        if cmd == "disable":
+            cmd_disable(); return 0
+        if cmd == "pause":
+            try:
+                minutes = int(args[1]) if len(args) > 1 else 30
+            except ValueError:
+                minutes = 30
+            cmd_pause(minutes); return 0
+        if cmd == "resume":
+            cmd_resume(); return 0
+        if cmd == "refresh":
+            clean = "--clean" in args[1:]
+            cmd_refresh(clean); return 0
+        if cmd == "status":
+            return cmd_status()
+        if cmd == "list":
+            cmd_list(); return 0
+        if cmd == "detect":
+            if len(args) < 2:
+                print("uso: uto detect \"comando\"")
+                return 1
+            cmd_detect(" ".join(args[1:]))
+            return 0
+        print(f"uto: subcomando desconhecido: {cmd}", file=sys.stderr)
+        return 1
+
+    # Shim mode
+    bypassed, rc = check_gate_and_maybe_bypass(invoked, sys.argv[1:])
+    if bypassed:
+        return rc
+    return run_shim(invoked, sys.argv[1:])
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
